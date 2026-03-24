@@ -1,0 +1,10 @@
+# ninja log v5
+1	448	7806583150540463	CMakeFiles/dummy.dir/src/main/cpp/dummy.cpp.o	52cbf7f63128228d
+449	930	7806583155360461	../../../../build/intermediates/cxx/Debug/4co1s1s5/obj/arm64-v8a/libdummy.so	1f727a376b4721b5
+1	12	0	clean	95e8c31c9a73b951
+1	10	0	clean	95e8c31c9a73b951
+0	11	0	clean	95e8c31c9a73b951
+1	12	0	clean	95e8c31c9a73b951
+1	390	7806617209222119	CMakeFiles/dummy.dir/src/main/cpp/dummy.cpp.o	52cbf7f63128228d
+391	750	7806617212823142	../../../../build/intermediates/cxx/Debug/4co1s1s5/obj/arm64-v8a/libdummy.so	1f727a376b4721b5
+1	789	7813509018220500	../../../../build/intermediates/cxx/Debug/4co1s1s5/obj/arm64-v8a/libdummy.so	1f727a376b4721b5

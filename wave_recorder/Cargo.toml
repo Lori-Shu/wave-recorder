@@ -1,0 +1,23 @@
+[package]
+name = "wave_recorder"
+version = "0.1.0"
+edition = "2024"
+[lib]
+name = "wave_recorder"
+path = "src/lib.rs"
+crate-type = ["cdylib","lib"]
+[dependencies]
+core_lib={path="../core_lib"}
+tracing = "0.1.44"
+tracing-subscriber = {version = "0.3.22",features = ["local-time"]}
+wgpu = { version = "27.0.1", features = ["vulkan"] }
+#egui dep list
+eframe = { version = "0.33.3",default-features=false, features = ["wgpu","android-native-activity","default_fonts","wayland"] }
+# eframe = { version = "0.33.3", features = ["wgpu"] }
+egui = "0.33.3"
+egui_extras = { version = "0.33.3", features = ["image"] }
+image = "0.25.10"
+winit = {version="0.30.13",features=["android-native-activity"]}
+cpal = "0.17.3"
+anyhow = "1.0.102"
+crossbeam-channel = "0.5.15"

@@ -1,0 +1,10 @@
+/target
+Cargo.lock
+/resources
+/.vscode
+/core_lib/resources
+/wave_recorder/resources
+/wave_recorder/android_gradle_app/app/build
+/wave_recorder/android_gradle_app/app/resources
+/wave_recorder/android_gradle_app/app/release
+/wave_recorder/android_gradle_app/app/src/main/jniLibs

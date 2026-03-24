@@ -1,0 +1,1 @@
+D:\rustprojects\words_game\android_example_native\app\CMakeLists.txt

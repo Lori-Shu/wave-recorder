@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <application
+        android:label="wave-recorder"
+        tools:targetApi="34"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round">
+                <activity
+                        android:name="org.my_audio_codec.MainActivity"
+                        android:exported="true"
+                        android:configChanges="layoutDirection|locale|orientation|keyboardHidden|screenSize|density|keyboard|navigation|screenLayout"
+                        android:theme="@style/Theme.AppCompat.NoActionBar"
+                        android:windowLayoutInDisplayCutoutMode="shortEdges">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="wave_recorder" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

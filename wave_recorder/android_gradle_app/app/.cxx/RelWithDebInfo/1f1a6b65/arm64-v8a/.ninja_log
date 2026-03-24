@@ -1,0 +1,3 @@
+# ninja log v5
+1	90	7952582988989606	CMakeFiles/dummy.dir/src/main/cpp/dummy.cpp.o	27f8c1455716096d
+91	229	7952582990364986	../../../../build/intermediates/cxx/RelWithDebInfo/1f1a6b65/obj/arm64-v8a/libdummy.so	7a9aa8143ede3b13

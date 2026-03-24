@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "core_lib",
+    "wave_recorder",
+]
+resolver = "3"

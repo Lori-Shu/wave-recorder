@@ -1,0 +1,3 @@
+D:/rustprojects/words_game/android_example_native/app/.cxx/Debug/4co1s1s5/arm64-v8a/CMakeFiles/dummy.dir
+D:/rustprojects/words_game/android_example_native/app/.cxx/Debug/4co1s1s5/arm64-v8a/CMakeFiles/edit_cache.dir
+D:/rustprojects/words_game/android_example_native/app/.cxx/Debug/4co1s1s5/arm64-v8a/CMakeFiles/rebuild_cache.dir

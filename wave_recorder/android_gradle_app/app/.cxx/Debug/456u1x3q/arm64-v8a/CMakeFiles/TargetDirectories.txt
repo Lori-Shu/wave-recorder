@@ -1,0 +1,3 @@
+D:/rustprojects/my-audio-codec/wave_recorder/android_gradle_app/app/.cxx/Debug/456u1x3q/arm64-v8a/CMakeFiles/dummy.dir
+D:/rustprojects/my-audio-codec/wave_recorder/android_gradle_app/app/.cxx/Debug/456u1x3q/arm64-v8a/CMakeFiles/edit_cache.dir
+D:/rustprojects/my-audio-codec/wave_recorder/android_gradle_app/app/.cxx/Debug/456u1x3q/arm64-v8a/CMakeFiles/rebuild_cache.dir
