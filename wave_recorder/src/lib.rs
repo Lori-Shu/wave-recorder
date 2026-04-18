@@ -2,6 +2,7 @@
 #![deny(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{Arc, RwLock, atomic::AtomicBool},
     thread::JoinHandle,
@@ -16,18 +17,29 @@ use crossbeam_channel::{Receiver, Sender};
 use eframe::{
     App, CreationContext,
     egui_wgpu::{WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew},
+    wgpu::{
+        BackendOptions, Backends, DeviceDescriptor, InstanceDescriptor, InstanceFlags,
+        MemoryBudgetThresholds,
+    },
 };
 use egui::{
-    AtomExt, Button, Color32, Context, ImageSource, Layout, Pos2, Rect, SizeHint, TextureOptions,
-    Ui, Vec2, emath::OrderedFloat, include_image, load::{SizedTexture, TexturePoll},
+    AtomExt, Button, Color32, ComboBox, ImageSource, Layout, Pos2, Rect, RichText, ScrollArea,
+    SizeHint, TextureOptions, Ui, Vec2,
+    emath::OrderedFloat,
+    include_image,
+    load::{SizedTexture, TexturePoll},
 };
+use egui_plot::{Line, Plot, PlotPoints};
 use my_audio_codec::{AudioCodecResult, codec::TinyEncoder};
 use tracing::{Level, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use wgpu::{Backends, InstanceDescriptor};
 
-use crate::audio_play::AudioPlayer;
+use crate::{
+    audio_play::AudioPlayer,
+    effect_filter::{EffectFilter, SelectedEffect},
+};
 mod audio_play;
+mod effect_filter;
 
 const PLAY_IMG: ImageSource = include_image!("../resources/play.png");
 const PAUSE_IMG: ImageSource = include_image!("../resources/pause.png");
@@ -61,9 +73,15 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
             wgpu_setup: WgpuSetup::CreateNew(WgpuSetupCreateNew {
                 instance_descriptor: InstanceDescriptor {
                     backends: Backends::VULKAN,
-                    ..Default::default()
+                    flags: InstanceFlags::default(),
+                    memory_budget_thresholds: MemoryBudgetThresholds::default(),
+                    backend_options: BackendOptions::default(),
+                    display: None,
                 },
-                ..Default::default()
+                display_handle: None,
+                power_preference: eframe::wgpu::PowerPreference::None,
+                native_adapter_selector: None,
+                device_descriptor: Arc::new(|_adapter| DeviceDescriptor::default()),
             }),
             ..Default::default()
         },
@@ -104,6 +122,9 @@ pub struct WaveRecorder {
     is_encoding: Arc<AtomicBool>,
     encode_thread: Option<JoinHandle<AudioCodecResult<()>>>,
     background_tex_poll: Option<SizedTexture>,
+    selected_effect: Arc<RwLock<SelectedEffect>>,
+    line_points_queue: VecDeque<f32>,
+    point_sample_channel: (Sender<f32>, Receiver<f32>),
 }
 impl WaveRecorder {
     pub fn new(_e_context: &CreationContext) -> AudioCodecResult<Self> {
@@ -115,6 +136,9 @@ impl WaveRecorder {
             RECORD_CHANNELS,
         )?));
         let audio_player = AudioPlayer::new()?;
+        let selected_effect = Arc::new(RwLock::new(SelectedEffect::None));
+        let line_points_queue = VecDeque::new();
+        let point_sample_channel = crossbeam_channel::unbounded();
         Ok(Self {
             microphone_manager,
             my_encoder,
@@ -128,21 +152,45 @@ impl WaveRecorder {
             is_encoding: Arc::new(AtomicBool::new(false)),
             playing_record_path: None,
             background_tex_poll: None,
+            selected_effect,
+            line_points_queue,
+            point_sample_channel,
         })
     }
-    fn paint_main_page(&mut self, ctx: &Context, ui: &mut Ui) {
+    fn paint_main_page(&mut self, ui: &mut Ui) {
         let _ = ui.button("wave-recorder: a simple voice recorder");
+        self.paint_wave_line(ui);
         if ui.button("record list").clicked() {
             if self.scan_available_records().is_ok() {
                 self.router_page = RouterPage::List;
             }
         }
-        ui.add_space(ctx.content_rect().height() / 10.0);
+        ui.add_space(ui.content_rect().height() / 10.0);
+        if let Ok(mut selected_effect) = self.selected_effect.write() {
+            ComboBox::new(
+                "effect combobox",
+                RichText::new("select audio effect").strong(),
+            )
+            .selected_text(format!("selected:{}", *selected_effect))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut *selected_effect, SelectedEffect::None, "no effect");
+                ui.selectable_value(&mut *selected_effect, SelectedEffect::Wave, "wave effect");
+                ui.selectable_value(
+                    &mut *selected_effect,
+                    SelectedEffect::CicadaChirping,
+                    "cicada chirping",
+                );
+                ui.selectable_value(&mut *selected_effect, SelectedEffect::Rain, "rain effect");
+                ui.selectable_value(&mut *selected_effect, SelectedEffect::Piano, "piano effect");
+            });
+        }
+
+        ui.add_space(ui.content_rect().height() / 10.0);
         if self.is_recording {
             ui.with_layout(Layout::top_down(egui::Align::Center), |ui| {
                 let pause_btn = Button::new(PAUSE_IMG.atom_size(Vec2::new(
-                    ctx.content_rect().height() / 10.0,
-                    ctx.content_rect().height() / 10.0,
+                    ui.content_rect().height() / 10.0,
+                    ui.content_rect().height() / 10.0,
                 )));
                 let pause_response = ui.add(pause_btn);
                 if pause_response.clicked() {
@@ -152,8 +200,8 @@ impl WaveRecorder {
         } else {
             ui.with_layout(Layout::top_down(egui::Align::Center), |ui| {
                 let continue_btn = Button::new(PLAY_IMG.atom_size(Vec2::new(
-                    ctx.content_rect().height() / 10.0,
-                    ctx.content_rect().height() / 10.0,
+                    ui.content_rect().height() / 10.0,
+                    ui.content_rect().height() / 10.0,
                 )));
                 let continue_response = ui.add(continue_btn);
                 if continue_response.clicked() {
@@ -169,10 +217,10 @@ impl WaveRecorder {
                         info!("start encoding ok");
                     }
                 }
-                ui.add_space(ctx.content_rect().height() / 10.0);
+                ui.add_space(ui.content_rect().height() / 10.0);
                 let finish_btn = Button::new(STOP_IMG.atom_size(Vec2::new(
-                    ctx.content_rect().height() / 10.0,
-                    ctx.content_rect().height() / 10.0,
+                    ui.content_rect().height() / 10.0,
+                    ui.content_rect().height() / 10.0,
                 )));
                 let finish_response = ui.add(finish_btn);
                 if finish_response.clicked() {
@@ -195,35 +243,43 @@ impl WaveRecorder {
             });
         }
     }
-    fn paint_list_page(&mut self,ctx: &Context ,ui: &mut Ui) {
+    fn paint_list_page(&mut self, ui: &mut Ui) {
         if ui.button("back to main").clicked() {
             self.router_page = RouterPage::Main;
         }
         if let Some(record_file_path) = &self.playing_record_path {
             if let Some(path_str) = record_file_path.file_name() {
                 if let Some(file_name) = path_str.to_str() {
-                    ui.label(format!("playing record:{}", file_name));
+                    ui.add(Button::new(
+                        RichText::new(format!("playing record:{}", file_name)).strong(),
+                    ));
                 }
             }
         } else {
-            ui.label("playing record:None");
+            ui.add(Button::new(RichText::new("playing record: None").strong()));
         }
-        ui.with_layout(Layout::top_down(egui::Align::Center),|ui| {
+        ui.with_layout(Layout::top_down(egui::Align::Center), |ui| {
             if self.is_playing {
-                if ui.button(PAUSE_IMG.atom_size(Vec2::new(
-                    ctx.content_rect().height() / 10.0,
-                    ctx.content_rect().height() / 10.0,
-                ))).clicked() {
+                if ui
+                    .button(PAUSE_IMG.atom_size(Vec2::new(
+                        ui.content_rect().height() / 10.0,
+                        ui.content_rect().height() / 10.0,
+                    )))
+                    .clicked()
+                {
                     self.is_playing = false;
                     if self.audio_player.pause().is_ok() {
                         info!("play paused");
                     }
                 }
             } else {
-                if ui.button(PLAY_IMG.atom_size(Vec2::new(
-                    ctx.content_rect().height() / 10.0,
-                    ctx.content_rect().height() / 10.0,
-                ))).clicked() {
+                if ui
+                    .button(PLAY_IMG.atom_size(Vec2::new(
+                        ui.content_rect().height() / 10.0,
+                        ui.content_rect().height() / 10.0,
+                    )))
+                    .clicked()
+                {
                     self.is_playing = true;
                     if self.audio_player.play().is_ok() {
                         info!("play continued");
@@ -231,23 +287,37 @@ impl WaveRecorder {
                 }
             }
         });
-
-        ui.columns(1, |ui| {
-            for path in &self.available_records {
-                if let Some(f_name) = path.file_name() {
-                    if let Some(file_name) = f_name.to_str() {
-                        if ui[0].button(format!("{}", file_name)).clicked() {
-                            self.playing_record_path = Some(path.clone());
-                            if let Err(e) = self.audio_player.reset_player(path.clone()) {
-                                self.router_page =
-                                    RouterPage::Message(format!("reset player err:{}", e));
+        ScrollArea::vertical()
+            .min_scrolled_height(ui.content_rect().height() / 6.0)
+            .show(ui, |ui| {
+                ui.columns(1, |ui| {
+                    for path in &self.available_records {
+                        if let Some(f_name) = path.file_name() {
+                            if let Some(file_name) = f_name.to_str() {
+                                if ui[0]
+                                    .add(Button::new(
+                                        RichText::new(format!("{}", file_name)).atom_size(
+                                            Vec2::new(
+                                                ui[0].content_rect().height() / 6.0,
+                                                ui[0].content_rect().height() / 20.0,
+                                            ),
+                                        ),
+                                    ))
+                                    .clicked()
+                                {
+                                    self.playing_record_path = Some(path.clone());
+                                    if let Err(e) = self.audio_player.reset_player(path.clone()) {
+                                        self.router_page =
+                                            RouterPage::Message(format!("reset player err:{}", e));
+                                    }
+                                    self.is_playing = false;
+                                }
+                                ui[0].add_space(ui[0].content_rect().height() / 20.0);
                             }
-                            self.is_playing = false;
                         }
                     }
-                }
-            }
-        });
+                });
+            });
     }
     fn paint_msg_page(&mut self, msg: String, ui: &mut Ui) {
         ui.label(msg);
@@ -301,46 +371,80 @@ impl WaveRecorder {
         self.is_recording = true;
         self.is_encoding
             .store(true, std::sync::atomic::Ordering::Release);
-        let encode_fn = EncodeFn::new(self.my_encoder.clone(), receiver, self.is_encoding.clone());
+        let selected_effect = self.selected_effect.clone();
+        let effect_filter = EffectFilter::new()?;
+        let encode_fn = EncodeFn::new(
+            self.my_encoder.clone(),
+            receiver,
+            self.is_encoding.clone(),
+            selected_effect,
+            effect_filter,
+            self.point_sample_channel.0.clone(),
+        );
         self.encode_thread = Some(std::thread::spawn(encode_fn.into_closure()));
         Ok(())
     }
-    fn paint_background(&mut self, ctx: &Context, ui: &mut Ui) -> AudioCodecResult<()> {
-    
+    fn paint_background(&mut self, ui: &mut Ui) -> AudioCodecResult<()> {
         if let Some(texture) = &self.background_tex_poll {
-                ui.painter().image(
-                    texture.id,
-                    ctx.content_rect(),
-                    Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+            ui.painter().image(
+                texture.id,
+                ui.content_rect(),
+                Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
         } else {
-            let poll = BACKGROUND_IMG.load(
-                ctx,
+            let texture_poll = BACKGROUND_IMG.load(
+                ui.ctx(),
                 TextureOptions::LINEAR,
                 SizeHint::Scale(OrderedFloat(1.0)),
             )?;
-            if let TexturePoll::Ready { texture } = poll {
+            if let TexturePoll::Ready { texture } = texture_poll {
                 self.background_tex_poll = Some(texture);
             }
-            
         }
 
         Ok(())
     }
+    fn paint_wave_line(&mut self, ui: &mut Ui) {
+        if self.is_encoding.load(std::sync::atomic::Ordering::Acquire) {
+            if let Ok(sample) = self.point_sample_channel.1.try_recv() {
+                self.line_points_queue.push_back(sample);
+            }
+        }
+        let plot = Plot::new("wave line plot")
+            .height(ui.content_rect().height() / 4.0)
+            .allow_axis_zoom_drag(false)
+            .allow_boxed_zoom(false)
+            .allow_drag(false)
+            .allow_scroll(false)
+            .allow_zoom(false);
+        if self.line_points_queue.len() > 100 {
+            self.line_points_queue.pop_front();
+        }
+        let points = self
+            .line_points_queue
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| [idx as f64, (*item) as f64])
+            .collect::<PlotPoints>();
+        let line = Line::new("wave line", points);
+        plot.show(ui, |ui| {
+            ui.line(line);
+        });
+    }
 }
 impl App for WaveRecorder {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if let Err(e)=self.paint_background(ctx, ui) {
-                warn!("paint background err:{}",e);
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            if let Err(e) = self.paint_background(ui) {
+                warn!("paint background err:{}", e);
             }
             match &self.router_page {
-                RouterPage::Main => self.paint_main_page(ctx, ui),
-                RouterPage::List => self.paint_list_page(ctx,ui),
+                RouterPage::Main => self.paint_main_page(ui),
+                RouterPage::List => self.paint_list_page(ui),
                 RouterPage::Message(msg) => self.paint_msg_page(msg.clone(), ui),
             }
-            ctx.request_repaint_after(Duration::from_millis(1000 / 30));
+            ui.request_repaint_after(Duration::from_millis(1000 / 30));
         });
     }
 }
@@ -361,29 +465,52 @@ impl RecordFn {
 }
 struct EncodeFn {
     encoder: Arc<RwLock<TinyEncoder>>,
-    recv: Receiver<Vec<f32>>,
+    sample_chunk_recv: Receiver<Vec<f32>>,
     is_encoding: Arc<AtomicBool>,
+    selected_effect: Arc<RwLock<SelectedEffect>>,
+    effect_filter: EffectFilter,
+    paint_sample_sender: Sender<f32>,
 }
 impl EncodeFn {
     pub fn new(
         encoder: Arc<RwLock<TinyEncoder>>,
-        recv: Receiver<Vec<f32>>,
+        sample_chunk_recv: Receiver<Vec<f32>>,
         is_encoding: Arc<AtomicBool>,
+        selected_effect: Arc<RwLock<SelectedEffect>>,
+        effect_filter: EffectFilter,
+        paint_sample_sender: Sender<f32>,
     ) -> Self {
         Self {
             encoder,
-            recv,
+            sample_chunk_recv,
             is_encoding,
+            selected_effect,
+            effect_filter,
+            paint_sample_sender,
         }
     }
-    fn into_closure(self) -> impl FnOnce() -> AudioCodecResult<()> + Send + 'static {
+    fn into_closure(mut self) -> impl FnOnce() -> AudioCodecResult<()> + Send + 'static {
         move || {
             let mut encoder = self
                 .encoder
                 .write()
                 .map_err(|_e| anyhow::Error::msg("encoder write lock err"))?;
+            let mut counter = 0;
             loop {
-                if let Ok(samples) = self.recv.recv() {
+                if let Ok(mut samples) = self.sample_chunk_recv.recv() {
+                    for item in &mut samples {
+                        *item = (*item * 60.0).clamp(-1.0, 1.0);
+                        if counter == 0 {
+                            self.paint_sample_sender.send(*item)?;
+                        }
+                        counter += 1;
+                        counter %= 480;
+                    }
+                    let effect = self
+                        .selected_effect
+                        .read()
+                        .map_err(|_e| anyhow::Error::msg("read lock selected effect err"))?;
+                    let samples = self.effect_filter.filter(samples, effect.clone())?;
                     if encoder.encode(samples).is_err() {
                         warn!("encode sample err");
                     }

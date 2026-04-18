@@ -742,7 +742,7 @@ impl TinyDecoder {
         Ok(())
     }
     pub fn reset_input_file(&mut self, file_path: PathBuf) -> AudioCodecResult<()> {
-        let buf_reader = BufReader::with_capacity(1024 * 1024, File::open(file_path)?);
+        let buf_reader = BufReader::new(File::open(file_path)?);
         let bit_reader = BitReader::<_, LittleEndian>::new(buf_reader);
         self.file_bit_reader = Some(bit_reader);
         self.last_half.fill(0.0);
@@ -783,7 +783,7 @@ impl TinyDecoder {
         self.dequantize()?;
         // let now = Instant::now();
         let frame = self.apply_imdct()?;
-        info!("debug sample val:{}", frame[0]);
+        // info!("debug sample val:{}", frame[0]);
         // info!(
         //     "decode 1 frame consumed :{}micros",
         //     (Instant::now() - now).as_micros()

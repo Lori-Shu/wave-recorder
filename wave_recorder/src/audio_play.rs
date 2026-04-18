@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use crate::{RECORD_CHANNELS, RECORD_SAMPLE_RATE};
 
 pub struct AudioPlayer {
-    output_stream: Stream,
+    output_stream: Arc<Stream>,
     decoder: Arc<RwLock<TinyDecoder>>,
     decode_thread: Option<JoinHandle<AudioCodecResult<()>>>,
     is_decoding: Arc<AtomicBool>,
@@ -28,24 +28,8 @@ impl AudioPlayer {
         let decoder = Arc::new(RwLock::new(TinyDecoder::new()?));
         let (sender, recv) = crossbeam_channel::unbounded();
         let is_decoding = Arc::new(AtomicBool::new(false));
-        let default_host = cpal::default_host();
-        let device = default_host
-            .default_output_device()
-            .ok_or(anyhow::Error::msg("open output stream err"))?;
-        let config = StreamConfig {
-            channels: RECORD_CHANNELS as u16,
-            sample_rate: RECORD_SAMPLE_RATE,
-            buffer_size: cpal::BufferSize::Default,
-        };
         let decoding_cond_var = Arc::new(Condvar::new());
-        let audio_output_stream_callback =
-            AudioOutputStreamCallback::new(recv, decoding_cond_var.clone());
-        let output_stream = device.build_output_stream(
-            &config,
-            audio_output_stream_callback.into_closure(),
-            |e| warn!("{}", e),
-            None,
-        )?;
+        let output_stream = Arc::new(Self::rebuild_stream(recv, decoding_cond_var.clone())?);
         Ok(Self {
             output_stream,
             decoder,
@@ -54,6 +38,30 @@ impl AudioPlayer {
             sender,
             decoding_cond_var,
         })
+    }
+    fn rebuild_stream(
+        recv: Receiver<Vec<f32>>,
+        decoding_cond_var: Arc<Condvar>,
+    ) -> AudioCodecResult<Stream> {
+        let default_host = cpal::default_host();
+        let device = default_host
+            .default_output_device()
+            .ok_or(anyhow::Error::msg("open output stream err"))?;
+
+        let config = StreamConfig {
+            channels: RECORD_CHANNELS as u16,
+            sample_rate: RECORD_SAMPLE_RATE,
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        let audio_output_stream_callback = AudioOutputStreamCallback::new(recv, decoding_cond_var);
+        let output_stream = device.build_output_stream(
+            &config,
+            audio_output_stream_callback.into_closure(),
+            |e| warn!("{}", e),
+            None,
+        )?;
+        Ok(output_stream)
     }
     pub fn pause(&self) -> AudioCodecResult<()> {
         self.output_stream.pause()?;
@@ -86,7 +94,9 @@ impl AudioPlayer {
             .store(true, std::sync::atomic::Ordering::Release);
         let is_decoding = self.is_decoding.clone();
         let sender = self.sender.clone();
-        let decode_fn = DecodeFn::new(decoder, sender, is_decoding, self.decoding_cond_var.clone());
+        let condvar = self.decoding_cond_var.clone();
+        let stream = self.output_stream.clone();
+        let decode_fn = DecodeFn::new(decoder, sender, is_decoding, condvar, stream);
         self.decode_thread = Some(std::thread::spawn(decode_fn.into_closure()));
         Ok(())
     }
@@ -113,18 +123,12 @@ impl AudioOutputStreamCallback {
                     self.decoding_cond_var.notify_one();
                     if let Ok(item) = self.recv.try_recv() {
                         buffer_lock.extend(item);
-                        let buf_slice = buffer_lock
-                            .drain(0..buf.len())
-                            .map(|i| (i * 10.0).clamp(-1.0, 1.0))
-                            .collect::<Vec<f32>>();
-                        buf.copy_from_slice(&buf_slice);
+                        let buf_part = buffer_lock.drain(0..buf.len()).collect::<Vec<f32>>();
+                        buf.copy_from_slice(&buf_part);
                     }
                 } else {
-                    let buf_slice = buffer_lock
-                        .drain(0..buf.len())
-                        .map(|i| (i * 10.0).clamp(-1.0, 1.0))
-                        .collect::<Vec<f32>>();
-                    buf.copy_from_slice(&buf_slice);
+                    let buf_part = buffer_lock.drain(0..buf.len()).collect::<Vec<f32>>();
+                    buf.copy_from_slice(&buf_part);
                 }
             }
         }
@@ -136,6 +140,7 @@ struct DecodeFn {
     is_decoding: Arc<AtomicBool>,
     decoding_cond_var: Arc<Condvar>,
     decode_buffer: VecDeque<Vec<f32>>,
+    stream: Arc<Stream>,
 }
 impl DecodeFn {
     pub fn new(
@@ -143,6 +148,7 @@ impl DecodeFn {
         sender: Sender<Vec<f32>>,
         is_decoding: Arc<AtomicBool>,
         decoding_cond_var: Arc<Condvar>,
+        stream: Arc<Stream>,
     ) -> Self {
         let decode_buffer = VecDeque::new();
         Self {
@@ -151,6 +157,7 @@ impl DecodeFn {
             is_decoding,
             decoding_cond_var,
             decode_buffer,
+            stream,
         }
     }
     fn into_closure(mut self) -> impl FnOnce() -> AudioCodecResult<()> + Send + 'static {
@@ -161,12 +168,16 @@ impl DecodeFn {
                 .map_err(|_| anyhow::Error::msg("lock decoder err"))?;
             let flag_lock = Mutex::new(());
             loop {
-                if self.decode_buffer.len() < 10 {
-                    let pop_frame = decoder.pop_frame()?;
-                    self.decode_buffer.push_back(pop_frame.0);
+                if self.decode_buffer.len() < 32 {
+                    if let Ok(pop_frame) = decoder.pop_frame() {
+                        self.decode_buffer.push_back(pop_frame.0);
+                    } else {
+                        self.stream.pause()?;
+                        return Ok(());
+                    }
                 } else {
                     self.sender
-                        .send(self.decode_buffer.drain(0..10).flatten().collect())?;
+                        .send(self.decode_buffer.drain(0..32).flatten().collect())?;
                     let mutex_guard = flag_lock
                         .lock()
                         .map_err(|_| anyhow::Error::msg("flag lock err"))?;
