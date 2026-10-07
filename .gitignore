@@ -2,9 +2,8 @@
 Cargo.lock
 /resources
 /.vscode
+/.zed
 /core_lib/resources
+/core_lib/tests
 /wave_recorder/resources
-/wave_recorder/android_gradle_app/app/build
-/wave_recorder/android_gradle_app/app/resources
-/wave_recorder/android_gradle_app/app/release
-/wave_recorder/android_gradle_app/app/src/main/jniLibs
+/wave_recorder/android_gradle_app
