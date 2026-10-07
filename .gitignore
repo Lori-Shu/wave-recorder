@@ -2,6 +2,7 @@
 Cargo.lock
 /resources
 /.vscode
+/.zed
 /core_lib/resources
 /core_lib/tests
 /wave_recorder/resources
