@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use anyhow::Context;
 use bitstream_io::{BitRead2, BitReader, BitWrite2, BitWriter, LittleEndian};
 use hound::{SampleFormat, WavSpec};
 
@@ -14,11 +15,11 @@ use rustdct::{
     mdct::{Mdct, MdctViaDct4},
 };
 use time::format_description;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::AudioCodecResult;
 const DATA_FRAME_SIZE: usize = 1024;
-const QUALITY_FACTOR: f32 = 1.4;
+const QUALITY_FACTOR: f32 = 1.0;
 const MAX_REMAINDER_LEN: u32 = 8;
 pub struct TinyEncoder {
     bands: Vec<Range<usize>>,
@@ -38,8 +39,8 @@ pub struct TinyEncoder {
 impl TinyEncoder {
     pub fn new(app_folder: PathBuf, sample_rate: u32, channels: u8) -> AudioCodecResult<Self> {
         let mut delta_table = vec![0.0_f32; 64];
-        let base_d = 4e-7_f32;
-        let ratio = 1.24_f32;
+        let base_d = 1e-4_f32;
+        let ratio = 1.15_f32;
         for idx in 0..64 {
             delta_table[idx as usize] = base_d * ratio.powi(idx);
         }
@@ -78,24 +79,19 @@ impl TinyEncoder {
     }
     pub fn encode(&mut self, chunk_samples: Vec<f32>) -> AudioCodecResult<()> {
         self.samples_cache.extend(chunk_samples);
-        loop {
-            if let Ok(samples) = self.try_pop_frame() {
-                let mdct_output = self.apply_mdct(samples)?;
-                let band_energy = self.compute_band_energies(&mdct_output)?;
-                let masking_threshold = self.compute_masking_threshold(&band_energy)?;
-                let quantized_and_delta_indices =
-                    self.quantize(&mdct_output, &masking_threshold)?;
-                self.rice_compress(quantized_and_delta_indices.data)?;
-                self.frames += 1;
-                self.indicies.extend(
-                    quantized_and_delta_indices
-                        .indices
-                        .iter()
-                        .map(|i| i.iter().map(|a| (*a) as u8).collect()),
-                );
-            } else {
-                break;
-            }
+        while let Ok(samples) = self.try_pop_frame() {
+            let mdct_output = self.apply_mdct(samples)?;
+            let band_energy = self.compute_band_energies(&mdct_output)?;
+            let masking_threshold = self.compute_masking_threshold(&band_energy)?;
+            let quantized_and_delta_indices = self.quantize(&mdct_output, &masking_threshold)?;
+            self.rice_compress(quantized_and_delta_indices.data)?;
+            self.frames += 1;
+            self.indicies.extend(
+                quantized_and_delta_indices
+                    .indices
+                    .iter()
+                    .map(|i| i.iter().map(|a| (*a) as u8).collect()),
+            );
         }
         Ok(())
     }
@@ -141,7 +137,7 @@ impl TinyEncoder {
         // }
         self.last_half = samples;
         // info!("mdct completed!");
-        let scale = (2.0 / DATA_FRAME_SIZE as f32).sqrt();
+        let scale = (4.0 / DATA_FRAME_SIZE as f32).sqrt();
 
         for sample in &mut mdct_output {
             (*sample) *= scale;
@@ -167,12 +163,12 @@ impl TinyEncoder {
             let k_opt = if mean_u <= 1.0 {
                 0
             } else {
-                (mean_u.log2().floor() as u32).min(MAX_REMAINDER_LEN)
+                (mean_u.log2().floor() as u32).clamp(0, MAX_REMAINDER_LEN)
             };
             let tmp_bit_writer = self
                 .file_bit_writer
                 .as_mut()
-                .ok_or(anyhow::Error::msg("file bit writer err"))?;
+                .context("file bit writer err")?;
             self.header_manager
                 .write_remainder_len(tmp_bit_writer, k_opt)?;
 
@@ -248,7 +244,7 @@ impl TinyEncoder {
             Ok(frame)
         }
     }
-    fn compute_band_energies(&self, mdct_output: &Vec<f32>) -> AudioCodecResult<Vec<f32>> {
+    fn compute_band_energies(&self, mdct_output: &[f32]) -> AudioCodecResult<Vec<f32>> {
         // info!("into compute_band_energies");
         let mut band_energy = vec![0.0_f32; self.bands.len()];
         for (band_idx, band_range) in self.bands.iter().enumerate() {
@@ -260,31 +256,32 @@ impl TinyEncoder {
 
         Ok(band_energy)
     }
-    fn compute_masking_threshold(&self, band_energy: &Vec<f32>) -> AudioCodecResult<Vec<f32>> {
+    fn compute_masking_threshold(&self, band_energy: &[f32]) -> AudioCodecResult<Vec<f32>> {
         // info!("into compute_masking_threshold");
         let mut masking_threshold = vec![0.0_f32; self.bands.len()];
 
         for (band_idx, _band_range) in self.bands.iter().enumerate() {
             let freq_idx = band_idx as f32 / self.bands.len() as f32;
 
-            let snr_weight = if freq_idx > 0.1 && freq_idx < 0.4 {
-                0.01
-            } else {
-                0.04
-            };
+            let snr_weight = 1e-4;
+            let freq_hz = freq_idx * (self.sample_rate as f32 / 2.0);
+            let ath_db = 3.64 * (freq_hz / 1000.0).powf(-0.8)
+                - 6.5 * (-(freq_hz / 1000.0 - 3.3).powi(2) / 0.15).exp()
+                + 0.001 * (freq_hz / 1000.0).powi(4);
 
-            let thresh = band_energy[band_idx] * snr_weight;
+            let ath_offset = ath_db - (-5.0);
+            let psych_multiplier = 10.0_f32.powf(ath_offset / 20.0);
 
-            let ath_guard = 1e-8;
+            let final_weight = snr_weight * psych_multiplier.clamp(1.0, 10.0);
 
-            masking_threshold[band_idx] = thresh.max(ath_guard);
+            masking_threshold[band_idx] = band_energy[band_idx] * final_weight;
         }
         Ok(masking_threshold)
     }
     fn quantize(
         &self,
-        mdct_output: &Vec<f32>,
-        masking_threshold: &Vec<f32>,
+        mdct_output: &[f32],
+        masking_threshold: &[f32],
     ) -> AudioCodecResult<QuantizedAndDeltaIndices> {
         // info!("into quantize");
         let mut delta_indices = vec![];
@@ -335,35 +332,6 @@ impl TinyEncoder {
             indices: delta_indices,
         })
     }
-    fn _compute_skip_table(
-        &self,
-        band_energies: &[Vec<f32>],
-        masking_threshold: &[Vec<f32>],
-    ) -> AudioCodecResult<Vec<Vec<bool>>> {
-        let mut skip_flags = vec![vec![false; band_energies[0].len()]; band_energies.len()];
-        for frame_idx in 0..band_energies.len() {
-            for energy_idx in 0..band_energies[frame_idx].len() {
-                if band_energies[frame_idx][energy_idx] < masking_threshold[frame_idx][energy_idx] {
-                    skip_flags[frame_idx][energy_idx] = true;
-                }
-            }
-        }
-        Ok(skip_flags)
-    }
-    fn _find_band_idx(&self, count: usize) -> usize {
-        match count % 512 {
-            0..2 => 0,
-            2..4 => 1,
-            4..8 => 2,
-            8..16 => 3,
-            16..32 => 4,
-            32..64 => 5,
-            64..128 => 6,
-            128..256 => 7,
-            256..512 => 8,
-            _ => todo!(),
-        }
-    }
     pub fn save_file(&mut self) -> AudioCodecResult<()> {
         let now_local = time::OffsetDateTime::now_local()?;
         let formatter = format_description::parse("[year]-[month]-[day] [hour]-[minute]-[second]")?;
@@ -372,15 +340,13 @@ impl TinyEncoder {
         let file_path = self.app_folder.join(datetime_str);
         let file = File::create_new(format!(
             "{}.gla",
-            file_path
-                .to_str()
-                .ok_or(anyhow::Error::msg("file path to str err!"))?
+            file_path.to_str().context("file path to str err!")?
         ))?;
         {
             let mut tmp_file_writer = self
                 .file_bit_writer
                 .take()
-                .ok_or(anyhow::Error::msg("take file writer err"))?;
+                .context("take file writer err")?;
             tmp_file_writer.byte_align()?;
             tmp_file_writer.flush()?;
         }
@@ -429,20 +395,6 @@ struct CodecHeaderManager {}
 impl CodecHeaderManager {
     fn new() -> Self {
         CodecHeaderManager {}
-    }
-    fn _write_skip_table(
-        &self,
-        bw: &mut BitWriter<File, LittleEndian>,
-        skip_flags: &[Vec<bool>],
-    ) -> AudioCodecResult<()> {
-        warn!("write frame len{}", skip_flags.len() as u32);
-        bw.write(4 * 8, skip_flags.len() as u32)?;
-        for flags in skip_flags {
-            for b in flags {
-                bw.write_bit(*b)?;
-            }
-        }
-        Ok(())
     }
     fn write_frames_len(
         &self,
@@ -556,8 +508,8 @@ impl TinyDecoder {
     pub fn new() -> AudioCodecResult<Self> {
         let codec_header_manager = CodecHeaderManager::new();
         let mut delta_table = vec![0.0_f32; 64];
-        let base_d = 4e-7_f32;
-        let ratio = 1.24_f32;
+        let base_d = 1e-4_f32;
+        let ratio = 1.15_f32;
         for idx in 0..64 {
             delta_table[idx as usize] = base_d * ratio.powi(idx);
         }
@@ -567,7 +519,7 @@ impl TinyDecoder {
             rustdct::mdct::MdctViaDct4::new(plan_dct4, rustdct::mdct::window_fn::vorbis::<f32>);
         let scratch = vec![0.0; DATA_FRAME_SIZE];
         let last_half = vec![0.0_f32; DATA_FRAME_SIZE / 2];
-        let scale_factor = (2.0 / DATA_FRAME_SIZE as f32).sqrt();
+        let scale_factor = (4.0 / DATA_FRAME_SIZE as f32).sqrt();
         Ok(Self {
             file_bit_reader: None,
             codec_header_manager,
@@ -754,7 +706,7 @@ impl TinyDecoder {
         let bit_reader = self
             .file_bit_reader
             .as_mut()
-            .ok_or(anyhow::Error::msg("file bit reader is none"))?;
+            .context("file bit reader is none")?;
         let frames_len = self.codec_header_manager.read_frames_len(bit_reader)?;
         let sample_rate = self.codec_header_manager.read_sample_rate(bit_reader)?;
         let channels = self.codec_header_manager.read_channels(bit_reader)?;
@@ -772,7 +724,7 @@ impl TinyDecoder {
         let bit_reader = self
             .file_bit_reader
             .as_mut()
-            .ok_or(anyhow::Error::msg("file bit reader is none"))?;
+            .context("file bit reader is none")?;
         for band_idx in 0..self.bands.len() {
             let remainder_bits_len = self.codec_header_manager.read_remainder_len(bit_reader)?;
             for sample_idx in self.bands[band_idx].clone() {

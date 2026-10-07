@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context;
 use cpal::{
     InputCallbackInfo, Stream, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -87,19 +88,19 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         },
         ..Default::default()
     };
-    eframe::run_native(
+    if let Err(e) = eframe::run_native(
         "wave-recorder",
         options,
         Box::new(|cc| {
-            let recorder = match WaveRecorder::new(cc) {
-                Ok(recorder) => recorder,
-                Err(e) => panic!("new WaveRecorder err{}", e),
-            };
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(recorder))
+            match WaveRecorder::new(cc) {
+                Ok(recorder) => Ok(Box::new(recorder)),
+                Err(e) => Err(anyhow::Error::msg(format!("new WaveRecorder err{}", e)).into()),
+            }
         }),
-    )
-    .unwrap();
+    ) {
+        warn!("app crate error:{:?}", e);
+    }
 }
 enum RouterPage {
     Main,
@@ -113,13 +114,13 @@ pub struct WaveRecorder {
     microphone_manager: MicroPhoneManager,
     my_encoder: Arc<RwLock<TinyEncoder>>,
     router_page: RouterPage,
-    is_recording: bool,
-    is_recording_started: bool,
-    is_playing: bool,
+    recording_flag: bool,
+    recording_started_flag: bool,
+    playing_flag: bool,
     playing_record_path: Option<PathBuf>,
     available_records: Vec<PathBuf>,
     audio_player: AudioPlayer,
-    is_encoding: Arc<AtomicBool>,
+    encoding_flag: Arc<AtomicBool>,
     encode_thread: Option<JoinHandle<AudioCodecResult<()>>>,
     background_tex_poll: Option<SizedTexture>,
     selected_effect: Arc<RwLock<SelectedEffect>>,
@@ -128,7 +129,7 @@ pub struct WaveRecorder {
 }
 impl WaveRecorder {
     pub fn new(_e_context: &CreationContext) -> AudioCodecResult<Self> {
-        let is_recording = false;
+        let recording_flag = false;
         let microphone_manager = MicroPhoneManager::new()?;
         let my_encoder = Arc::new(RwLock::new(TinyEncoder::new(
             PathBuf::from(APP_DATA_FOLDER),
@@ -143,13 +144,13 @@ impl WaveRecorder {
             microphone_manager,
             my_encoder,
             router_page: RouterPage::Main,
-            is_recording,
-            is_recording_started: false,
-            is_playing: false,
+            recording_flag,
+            recording_started_flag: false,
+            playing_flag: false,
             available_records: vec![],
             audio_player,
             encode_thread: None,
-            is_encoding: Arc::new(AtomicBool::new(false)),
+            encoding_flag: Arc::new(AtomicBool::new(false)),
             playing_record_path: None,
             background_tex_poll: None,
             selected_effect,
@@ -158,12 +159,22 @@ impl WaveRecorder {
         })
     }
     fn paint_main_page(&mut self, ui: &mut Ui) {
-        let _ = ui.button("wave-recorder: a simple voice recorder");
+        if ui
+            .button("wave-recorder: a simple voice recorder")
+            .clicked()
+        {
+            self.router_page = RouterPage::Message("welcome".to_string());
+        }
+        if self
+            .encoding_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && let Ok(sample) = self.point_sample_channel.1.try_recv()
+        {
+            self.line_points_queue.push_back(sample);
+        }
         self.paint_wave_line(ui);
-        if ui.button("record list").clicked() {
-            if self.scan_available_records().is_ok() {
-                self.router_page = RouterPage::List;
-            }
+        if ui.button("record list").clicked() && self.scan_available_records().is_ok() {
+            self.router_page = RouterPage::List;
         }
         ui.add_space(ui.content_rect().height() / 10.0);
         if let Ok(mut selected_effect) = self.selected_effect.write() {
@@ -186,12 +197,13 @@ impl WaveRecorder {
         }
 
         ui.add_space(ui.content_rect().height() / 10.0);
-        if self.is_recording {
+        if self.recording_flag {
             ui.with_layout(Layout::top_down(egui::Align::Center), |ui| {
                 let pause_btn = Button::new(PAUSE_IMG.atom_size(Vec2::new(
                     ui.content_rect().height() / 10.0,
                     ui.content_rect().height() / 10.0,
-                )));
+                )))
+                .fill(Color32::from_white_alpha(50));
                 let pause_response = ui.add(pause_btn);
                 if pause_response.clicked() {
                     self.pause_recording();
@@ -202,16 +214,17 @@ impl WaveRecorder {
                 let continue_btn = Button::new(PLAY_IMG.atom_size(Vec2::new(
                     ui.content_rect().height() / 10.0,
                     ui.content_rect().height() / 10.0,
-                )));
+                )))
+                .fill(Color32::from_white_alpha(50));
                 let continue_response = ui.add(continue_btn);
                 if continue_response.clicked() {
-                    if !self.is_recording_started {
-                        if let Ok(mut encoder) = self.my_encoder.write() {
-                            if let Err(e) = encoder.reset_encoder() {
-                                self.router_page = RouterPage::Message(format!("{}", e));
-                            }
+                    if !self.recording_started_flag {
+                        if let Ok(mut encoder) = self.my_encoder.write()
+                            && let Err(e) = encoder.reset_encoder()
+                        {
+                            self.router_page = RouterPage::Message(format!("{}", e));
                         }
-                        self.is_recording_started = true;
+                        self.recording_started_flag = true;
                     }
                     if self.start_encoding().is_ok() {
                         info!("start encoding ok");
@@ -221,10 +234,11 @@ impl WaveRecorder {
                 let finish_btn = Button::new(STOP_IMG.atom_size(Vec2::new(
                     ui.content_rect().height() / 10.0,
                     ui.content_rect().height() / 10.0,
-                )));
+                )))
+                .fill(Color32::from_white_alpha(50));
                 let finish_response = ui.add(finish_btn);
                 if finish_response.clicked() {
-                    if self.is_recording_started {
+                    if self.recording_started_flag {
                         if let Ok(mut encoder) = self.my_encoder.write() {
                             if let Err(e) = encoder.save_file() {
                                 self.router_page =
@@ -232,7 +246,7 @@ impl WaveRecorder {
                             } else {
                                 self.router_page =
                                     RouterPage::Message("record is finished and saved".to_string());
-                                self.is_recording_started = false;
+                                self.recording_started_flag = false;
                             }
                         }
                     } else {
@@ -244,22 +258,30 @@ impl WaveRecorder {
         }
     }
     fn paint_list_page(&mut self, ui: &mut Ui) {
+        if self
+            .encoding_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && let Ok(sample) = self.point_sample_channel.1.try_recv()
+        {
+            self.line_points_queue.push_back(sample);
+        }
+        self.paint_wave_line(ui);
         if ui.button("back to main").clicked() {
             self.router_page = RouterPage::Main;
         }
         if let Some(record_file_path) = &self.playing_record_path {
-            if let Some(path_str) = record_file_path.file_name() {
-                if let Some(file_name) = path_str.to_str() {
-                    ui.add(Button::new(
-                        RichText::new(format!("playing record:{}", file_name)).strong(),
-                    ));
-                }
+            if let Some(path_str) = record_file_path.file_name()
+                && let Some(file_name) = path_str.to_str()
+            {
+                ui.add(Button::new(
+                    RichText::new(format!("playing record:{}", file_name)).strong(),
+                ));
             }
         } else {
             ui.add(Button::new(RichText::new("playing record: None").strong()));
         }
         ui.with_layout(Layout::top_down(egui::Align::Center), |ui| {
-            if self.is_playing {
+            if self.playing_flag {
                 if ui
                     .button(PAUSE_IMG.atom_size(Vec2::new(
                         ui.content_rect().height() / 10.0,
@@ -267,7 +289,13 @@ impl WaveRecorder {
                     )))
                     .clicked()
                 {
-                    self.is_playing = false;
+                    self.playing_flag = false;
+                    if self.audio_player.pause().is_ok() {
+                        info!("play paused");
+                    }
+                }
+                if self.audio_player.is_end() {
+                    self.playing_flag = false;
                     if self.audio_player.pause().is_ok() {
                         info!("play paused");
                     }
@@ -280,7 +308,7 @@ impl WaveRecorder {
                     )))
                     .clicked()
                 {
-                    self.is_playing = true;
+                    self.playing_flag = true;
                     if self.audio_player.play().is_ok() {
                         info!("play continued");
                     }
@@ -292,28 +320,29 @@ impl WaveRecorder {
             .show(ui, |ui| {
                 ui.columns(1, |ui| {
                     for path in &self.available_records {
-                        if let Some(f_name) = path.file_name() {
-                            if let Some(file_name) = f_name.to_str() {
-                                if ui[0]
-                                    .add(Button::new(
-                                        RichText::new(format!("{}", file_name)).atom_size(
-                                            Vec2::new(
-                                                ui[0].content_rect().height() / 6.0,
-                                                ui[0].content_rect().height() / 20.0,
-                                            ),
-                                        ),
-                                    ))
-                                    .clicked()
+                        if let Some(f_name) = path.file_name()
+                            && let Some(file_name) = f_name.to_str()
+                        {
+                            if ui[0]
+                                .add(Button::new(RichText::new(file_name.to_string()).atom_size(
+                                    Vec2::new(
+                                        ui[0].content_rect().height() / 6.0,
+                                        ui[0].content_rect().height() / 20.0,
+                                    ),
+                                )))
+                                .clicked()
+                            {
+                                self.playing_record_path = Some(path.clone());
+                                if let Err(e) = self
+                                    .audio_player
+                                    .reset_player(path.clone(), self.point_sample_channel.0.clone())
                                 {
-                                    self.playing_record_path = Some(path.clone());
-                                    if let Err(e) = self.audio_player.reset_player(path.clone()) {
-                                        self.router_page =
-                                            RouterPage::Message(format!("reset player err:{}", e));
-                                    }
-                                    self.is_playing = false;
+                                    self.router_page =
+                                        RouterPage::Message(format!("reset player err:{}", e));
                                 }
-                                ui[0].add_space(ui[0].content_rect().height() / 20.0);
+                                self.playing_flag = false;
                             }
+                            ui[0].add_space(ui[0].content_rect().height() / 20.0);
                         }
                     }
                 });
@@ -329,28 +358,24 @@ impl WaveRecorder {
         self.available_records.clear();
         let path = PathBuf::from(APP_DATA_FOLDER);
         let mut read_dir = path.read_dir()?;
-        loop {
-            if let Some(Ok(item)) = read_dir.next() {
-                if item
-                    .file_name()
-                    .to_str()
-                    .ok_or(anyhow::Error::msg("file name to str err"))?
-                    .ends_with(".gla")
-                {
-                    self.available_records.push(item.path());
-                }
-            } else {
-                break;
+        while let Some(Ok(item)) = read_dir.next() {
+            if item
+                .file_name()
+                .to_str()
+                .context("file name to str err")?
+                .ends_with(".gla")
+            {
+                self.available_records.push(item.path());
             }
         }
         Ok(())
     }
     fn pause_recording(&mut self) {
-        self.is_recording = false;
+        self.recording_flag = false;
         self.microphone_manager.end_input();
 
-        self.is_encoding
-            .store(false, std::sync::atomic::Ordering::Release);
+        self.encoding_flag
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(handle) = self.encode_thread.take() {
             match handle.join() {
                 Ok(r) => {
@@ -368,15 +393,15 @@ impl WaveRecorder {
     fn start_encoding(&mut self) -> AudioCodecResult<()> {
         let (sender, receiver) = crossbeam_channel::unbounded();
         self.microphone_manager.open_audio_input(sender)?;
-        self.is_recording = true;
-        self.is_encoding
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.recording_flag = true;
+        self.encoding_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let selected_effect = self.selected_effect.clone();
         let effect_filter = EffectFilter::new()?;
         let encode_fn = EncodeFn::new(
             self.my_encoder.clone(),
             receiver,
-            self.is_encoding.clone(),
+            self.encoding_flag.clone(),
             selected_effect,
             effect_filter,
             self.point_sample_channel.0.clone(),
@@ -406,18 +431,16 @@ impl WaveRecorder {
         Ok(())
     }
     fn paint_wave_line(&mut self, ui: &mut Ui) {
-        if self.is_encoding.load(std::sync::atomic::Ordering::Acquire) {
-            if let Ok(sample) = self.point_sample_channel.1.try_recv() {
-                self.line_points_queue.push_back(sample);
-            }
-        }
         let plot = Plot::new("wave line plot")
             .height(ui.content_rect().height() / 4.0)
             .allow_axis_zoom_drag(false)
             .allow_boxed_zoom(false)
             .allow_drag(false)
             .allow_scroll(false)
-            .allow_zoom(false);
+            .allow_zoom(false)
+            .show_grid([false, false])
+            .default_x_bounds(0.0, 100.0)
+            .default_y_bounds(0.0, 1.1);
         if self.line_points_queue.len() > 100 {
             self.line_points_queue.pop_front();
         }
@@ -427,7 +450,7 @@ impl WaveRecorder {
             .enumerate()
             .map(|(idx, item)| [idx as f64, (*item) as f64])
             .collect::<PlotPoints>();
-        let line = Line::new("wave line", points);
+        let line = Line::new("wave line", points).color(Color32::LIGHT_BLUE);
         plot.show(ui, |ui| {
             ui.line(line);
         });
@@ -496,13 +519,16 @@ impl EncodeFn {
                 .write()
                 .map_err(|_e| anyhow::Error::msg("encoder write lock err"))?;
             let mut counter = 0;
+            let mut chunk_max = 0.0_f32;
             loop {
                 if let Ok(mut samples) = self.sample_chunk_recv.recv() {
                     for item in &mut samples {
                         *item = (*item * 60.0).clamp(-1.0, 1.0);
                         if counter == 0 {
-                            self.paint_sample_sender.send(*item)?;
+                            self.paint_sample_sender.send(chunk_max)?;
+                            chunk_max = 0.0;
                         }
+                        chunk_max = chunk_max.max((*item).abs());
                         counter += 1;
                         counter %= 480;
                     }
@@ -515,7 +541,7 @@ impl EncodeFn {
                         warn!("encode sample err");
                     }
                 } else {
-                    if !self.is_encoding.load(std::sync::atomic::Ordering::Acquire) {
+                    if !self.is_encoding.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
                 }
@@ -540,7 +566,7 @@ impl MicroPhoneManager {
         let default_host = cpal::default_host();
         let default_input_device = default_host
             .default_input_device()
-            .ok_or(anyhow::Error::msg("no default audio input device"))?;
+            .context("no default audio input device")?;
         let config = StreamConfig {
             channels: RECORD_CHANNELS as u16,
             sample_rate: RECORD_SAMPLE_RATE,

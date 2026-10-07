@@ -3,5 +3,6 @@ Cargo.lock
 /resources
 /.vscode
 /core_lib/resources
+/core_lib/tests
 /wave_recorder/resources
 /wave_recorder/android_gradle_app

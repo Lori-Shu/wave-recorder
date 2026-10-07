@@ -5,6 +5,7 @@ use std::{
     thread::JoinHandle,
 };
 
+use anyhow::Context;
 use cpal::{
     OutputCallbackInfo, Stream, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -19,34 +20,37 @@ pub struct AudioPlayer {
     output_stream: Arc<Stream>,
     decoder: Arc<RwLock<TinyDecoder>>,
     decode_thread: Option<JoinHandle<AudioCodecResult<()>>>,
-    is_decoding: Arc<AtomicBool>,
-    sender: Sender<Vec<f32>>,
+    decoding_flag: Arc<AtomicBool>,
+    frame_sender: Sender<Vec<f32>>,
     decoding_cond_var: Arc<Condvar>,
+    frame_end_flag: Arc<AtomicBool>,
 }
 impl AudioPlayer {
     pub fn new() -> AudioCodecResult<Self> {
         let decoder = Arc::new(RwLock::new(TinyDecoder::new()?));
-        let (sender, recv) = crossbeam_channel::unbounded();
-        let is_decoding = Arc::new(AtomicBool::new(false));
+        let (frame_sender, recv) = crossbeam_channel::unbounded();
+        let decoding_flag = Arc::new(AtomicBool::new(false));
         let decoding_cond_var = Arc::new(Condvar::new());
-        let output_stream = Arc::new(Self::rebuild_stream(recv, decoding_cond_var.clone())?);
+        let (output_stream, frame_end_flag) =
+            Self::rebuild_stream(recv, decoding_cond_var.clone())?;
         Ok(Self {
-            output_stream,
+            output_stream: Arc::new(output_stream),
             decoder,
-            is_decoding,
+            decoding_flag,
             decode_thread: None,
-            sender,
+            frame_sender,
             decoding_cond_var,
+            frame_end_flag,
         })
     }
     fn rebuild_stream(
         recv: Receiver<Vec<f32>>,
         decoding_cond_var: Arc<Condvar>,
-    ) -> AudioCodecResult<Stream> {
+    ) -> AudioCodecResult<(Stream, Arc<AtomicBool>)> {
         let default_host = cpal::default_host();
         let device = default_host
             .default_output_device()
-            .ok_or(anyhow::Error::msg("open output stream err"))?;
+            .context("open output stream err")?;
 
         let config = StreamConfig {
             channels: RECORD_CHANNELS as u16,
@@ -54,14 +58,15 @@ impl AudioPlayer {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let audio_output_stream_callback = AudioOutputStreamCallback::new(recv, decoding_cond_var);
+        let (audio_output_stream_callback, frame_end_flag) =
+            AudioOutputStreamCallback::new(recv, decoding_cond_var);
         let output_stream = device.build_output_stream(
             &config,
             audio_output_stream_callback.into_closure(),
             |e| warn!("{}", e),
             None,
         )?;
-        Ok(output_stream)
+        Ok((output_stream, frame_end_flag))
     }
     pub fn pause(&self) -> AudioCodecResult<()> {
         self.output_stream.pause()?;
@@ -71,10 +76,18 @@ impl AudioPlayer {
         self.output_stream.play()?;
         Ok(())
     }
-    pub fn reset_player(&mut self, file_path: PathBuf) -> AudioCodecResult<()> {
+    pub fn is_end(&mut self) -> bool {
+        self.frame_end_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn reset_player(
+        &mut self,
+        file_path: PathBuf,
+        sample_sender: Sender<f32>,
+    ) -> AudioCodecResult<()> {
         if let Some(th) = self.decode_thread.take() {
-            self.is_decoding
-                .store(false, std::sync::atomic::Ordering::Release);
+            self.decoding_flag
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             self.decoding_cond_var.notify_one();
             th.join().map_err(|_| anyhow::Error::msg("join th err"))??;
             info!("decode thread exit successfully");
@@ -90,41 +103,60 @@ impl AudioPlayer {
         self.output_stream.pause()?;
 
         let decoder = self.decoder.clone();
-        self.is_decoding
-            .store(true, std::sync::atomic::Ordering::Release);
-        let is_decoding = self.is_decoding.clone();
-        let sender = self.sender.clone();
+        self.decoding_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let is_decoding = self.decoding_flag.clone();
+        let frame_sender = self.frame_sender.clone();
         let condvar = self.decoding_cond_var.clone();
         let stream = self.output_stream.clone();
-        let decode_fn = DecodeFn::new(decoder, sender, is_decoding, condvar, stream);
+        let decode_fn = DecodeFn::new(
+            decoder,
+            frame_sender,
+            is_decoding,
+            condvar,
+            stream,
+            sample_sender,
+        );
         self.decode_thread = Some(std::thread::spawn(decode_fn.into_closure()));
         Ok(())
     }
 }
 
 struct AudioOutputStreamCallback {
-    recv: Receiver<Vec<f32>>,
+    frame_recv: Receiver<Vec<f32>>,
     decoding_cond_var: Arc<Condvar>,
     audio_buffer: Arc<Mutex<VecDeque<f32>>>,
+    frame_end_flag: Arc<AtomicBool>,
 }
 impl AudioOutputStreamCallback {
-    pub fn new(recv: Receiver<Vec<f32>>, decoding_cond_var: Arc<Condvar>) -> Self {
+    pub fn new(
+        frame_recv: Receiver<Vec<f32>>,
+        decoding_cond_var: Arc<Condvar>,
+    ) -> (Self, Arc<AtomicBool>) {
         let audio_buffer = Arc::new(Mutex::new(VecDeque::new()));
-        Self {
-            recv,
-            decoding_cond_var,
-            audio_buffer,
-        }
+        let frame_end_flag = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                frame_recv,
+                decoding_cond_var,
+                audio_buffer,
+                frame_end_flag: frame_end_flag.clone(),
+            },
+            frame_end_flag,
+        )
     }
     fn into_closure(self) -> impl FnMut(&mut [f32], &OutputCallbackInfo) + Send + 'static {
         move |buf, _| {
             if let Ok(mut buffer_lock) = self.audio_buffer.lock() {
                 if buffer_lock.len() < buf.len() {
                     self.decoding_cond_var.notify_one();
-                    if let Ok(item) = self.recv.try_recv() {
+                    if let Ok(item) = self.frame_recv.try_recv() {
                         buffer_lock.extend(item);
                         let buf_part = buffer_lock.drain(0..buf.len()).collect::<Vec<f32>>();
                         buf.copy_from_slice(&buf_part);
+                    } else {
+                        self.frame_end_flag
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 } else {
                     let buf_part = buffer_lock.drain(0..buf.len()).collect::<Vec<f32>>();
@@ -136,28 +168,31 @@ impl AudioOutputStreamCallback {
 }
 struct DecodeFn {
     decoder: Arc<RwLock<TinyDecoder>>,
-    sender: Sender<Vec<f32>>,
-    is_decoding: Arc<AtomicBool>,
+    frame_sender: Sender<Vec<f32>>,
+    decoding_flag: Arc<AtomicBool>,
     decoding_cond_var: Arc<Condvar>,
     decode_buffer: VecDeque<Vec<f32>>,
     stream: Arc<Stream>,
+    sample_sender: Sender<f32>,
 }
 impl DecodeFn {
     pub fn new(
         decoder: Arc<RwLock<TinyDecoder>>,
-        sender: Sender<Vec<f32>>,
-        is_decoding: Arc<AtomicBool>,
+        frame_sender: Sender<Vec<f32>>,
+        decoding_flag: Arc<AtomicBool>,
         decoding_cond_var: Arc<Condvar>,
         stream: Arc<Stream>,
+        sample_sender: Sender<f32>,
     ) -> Self {
         let decode_buffer = VecDeque::new();
         Self {
             decoder,
-            sender,
-            is_decoding,
+            frame_sender,
+            decoding_flag,
             decoding_cond_var,
             decode_buffer,
             stream,
+            sample_sender,
         }
     }
     fn into_closure(mut self) -> impl FnOnce() -> AudioCodecResult<()> + Send + 'static {
@@ -167,16 +202,27 @@ impl DecodeFn {
                 .write()
                 .map_err(|_| anyhow::Error::msg("lock decoder err"))?;
             let flag_lock = Mutex::new(());
+            let mut counter = 0;
+            let mut chunk_max = 0.0_f32;
             loop {
                 if self.decode_buffer.len() < 32 {
                     if let Ok(pop_frame) = decoder.pop_frame() {
+                        for item in &pop_frame.0 {
+                            if counter == 0 {
+                                self.sample_sender.send(chunk_max)?;
+                                chunk_max = 0.0;
+                            }
+                            chunk_max = chunk_max.max((*item).abs());
+                            counter += 1;
+                            counter %= 480;
+                        }
                         self.decode_buffer.push_back(pop_frame.0);
                     } else {
                         self.stream.pause()?;
                         return Ok(());
                     }
                 } else {
-                    self.sender
+                    self.frame_sender
                         .send(self.decode_buffer.drain(0..32).flatten().collect())?;
                     let mutex_guard = flag_lock
                         .lock()
@@ -186,7 +232,10 @@ impl DecodeFn {
                         .wait(mutex_guard)
                         .map_err(|_| anyhow::Error::msg("wait decoding cond var"))?;
                 }
-                if !self.is_decoding.load(std::sync::atomic::Ordering::Acquire) {
+                if !self
+                    .decoding_flag
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     break;
                 }
             }
